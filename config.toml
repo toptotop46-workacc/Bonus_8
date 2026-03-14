@@ -1,0 +1,48 @@
+# Soneium Season 8 Bonus Tasks Bot — конфигурация
+
+# Soneium RPC
+rpc_url = "https://soneium-rpc.publicnode.com"
+
+# Пауза между аккаунтами (секунды, случайная в диапазоне [min, max])
+delay_min = 30
+delay_max = 120
+
+# Пауза между действиями внутри одного аккаунта (секунды)
+action_delay_min = 1
+action_delay_max = 10
+
+# Отключить проверку SSL (для некоторых прокси)
+disable_ssl = true
+
+# Перемешивать порядок кошельков при каждом запуске
+shuffle_wallets = true
+
+# Газ estimate × этот коэффициент
+gas_limit_multiplier = 1.2
+
+# LI.FI API ключ (для других модулей при необходимости)
+lifi_api_key = "aeaa4f26-c3c3-4b71-aad3-50bd82faf815.1e83cb78-2d75-412d-a310-57272fd0e622"
+
+# ── Kami (Puzzle Pieces) — только браузерная версия ─────────────────────────
+# Проверка портала → при нехватке USDC.E добор через LI.FI → AdsPower + Playwright → kamiunlimited.com → покупка в UI.
+kami_collection_url = "https://www.kamiunlimited.com/collection/410"
+kami_login_wait_timeout_sec = 60
+kami_purchase_wait_timeout_sec = 120
+# firstmail_accounts.txt в корне проекта: строки email:password (firstmail.ltd)
+
+# USDC.E для оплаты на сайте (проверка баланса и добор через LI.FI при нехватке)
+kami_week1_payment_token = "0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369"
+kami_week1_payment_amount = 1000000   # 1.000000 USDC.E (6 decimals)
+kami_lifi_enabled = true
+kami_lifi_eth_min = 0.0007
+kami_lifi_eth_max = 0.0015
+kami_lifi_gas_reserve_eth = 0.0005
+
+# ── Press A ──────────────────────────────────────────────────────────────────
+# Порог USDSC ниже которого докупаем через LI.FI (raw, 6 decimals)
+press_a_usdsc_min_raw = 250000    # 0.25 USDSC — минимум для покупки
+press_a_usdsc_max_raw = 1000000   # 1.00 USDSC — максимум для покупки
+# Цель по кол-ву item-NFT для первоначального bootstrap минта
+press_a_rug_target = 200
+# Максимум циклов в основном цикле (Shell + Stone + Sell)
+press_a_max_cycles = 100
