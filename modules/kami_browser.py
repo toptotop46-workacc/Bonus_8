@@ -599,7 +599,18 @@ async def _kami_import_wallet(cdp_endpoint: str, private_key: str, password: str
         await asyncio.sleep(0.3)
         await page.wait_for_selector('button.ant-btn-primary:has-text("Confirm"):not([disabled])', timeout=60000)
         await page.click('button.ant-btn-primary:has-text("Confirm"):not([disabled])')
-        await page.wait_for_selector("text=Imported Successfully", timeout=60000)
+        import_success = asyncio.create_task(page.wait_for_selector("text=Imported Successfully", timeout=60000))
+        address_imported = asyncio.create_task(page.wait_for_selector("text=Address Imported", timeout=60000))
+        done, pending = await asyncio.wait(
+            [import_success, address_imported],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         logger.info("Kami: кошелёк импортирован в Rabby")
         await page.close()
         # Закрыть вкладки Rabby и Bitwarden, но оставить минимум одну вкладку — иначе браузер закроется
