@@ -902,8 +902,8 @@ async def _do_gm(page, eoa_address: str) -> None:
         await send_btn.click(timeout=10000)
         logger.success('Нажата "Send GM back"')
 
-        await page.locator("h2:has-text('GM sent!')").wait_for(state="visible", timeout=120000)
-        logger.success('Модальное окно "GM sent!" появилось')
+        await page.locator("h2").filter(has_text=re.compile(r"GM sent!|You got 1 STAR Point!", re.IGNORECASE)).wait_for(state="visible", timeout=120000)
+        logger.success('Модальное окно "GM sent!" / "You got 1 STAR Point!" появилось')
 
         try:
             text = await _get_next_gm_text_from_modal(page)
