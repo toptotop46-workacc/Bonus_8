@@ -56,6 +56,9 @@ SALE_UPGRADE_CONTRACT = "0xF3d98F2B3403723d8417FeA42b4E166d599ea3f9"
 
 APE_TIER_INDEX    = 1  # Stone ticket → Ape (no VRF, 0.1% Unique)
 HODLER_TIER_INDEX = 2  # Shell ticket → Hodler (Pyth VRF, 4% Unique)
+ALPHA_TIER_INDEX  = 3  # Shell ticket → Alpha (Pyth VRF, 11% Unique)
+DEGEN_TIER_INDEX  = 4  # Gold ticket  → Degen (Pyth VRF, 40% Unique)
+LFG_TIER_INDEX    = 5  # Gold ticket  → LFG (Pyth VRF, 50% Unique)
 
 USDSC_MIN_BALANCE = 250_000   # 0.25 USDSC — порог ниже которого докупаем
 
@@ -909,6 +912,210 @@ async def _spin_all_stone(
     return False
 
 
+async def _spin_by_tickets(
+    w3,
+    account,
+    addr_cs: str,
+    eoa_address: str,
+    *,
+    gacha,
+    tier_index: int,
+    is_batch: bool,
+    count_spins: int,
+    vrf_required: bool,
+    gas_multiplier: float,
+    label: str,
+) -> bool:
+    """
+    Делает спин(ы) за тикеты через requestGachaByTicket.
+    Возвращает True если выпал Unique.
+    """
+    value = ENTROPY_FEE_WEI if vrf_required else 0
+    try:
+        req_hash = await send_contract_tx(
+            w3, account,
+            gacha.functions.requestGachaByTicket(tier_index, is_batch),
+            value=value,
+            action=f"[{addr_cs[:8]}] requestGachaByTicket({label},{'batch' if is_batch else 'single'})",
+            gas_multiplier=gas_multiplier,
+        )
+        req_receipt = await _get_receipt(w3, req_hash)
+        req_gas = _get_gas_cost_from_receipt(dict(req_receipt)) if req_receipt else 0
+        _inc_press_a_stats(
+            eoa_address,
+            spins=count_spins,
+            eth_vrf_wei=value,
+            eth_gas_wei=req_gas,
+        )
+
+        if not vrf_required:
+            if req_receipt:
+                grades = _parse_all_grades_from_receipt(dict(req_receipt))
+                if grades:
+                    grade_names = [GRADE_NAMES.get(g, str(g)) for g in grades]
+                    logger.info(f"[{addr_cs[:8]}] {label} grades: {grade_names}")
+                if GRADE_UNIQUE in grades:
+                    logger.success(f"[{addr_cs[:8]}] UNIQUE выпал при {label} спине!")
+                    return True
+            return False
+
+        # VRF path (tier 2+)
+        if await _wait_vrf(gacha, addr_cs):
+            result_hash = await send_contract_tx(
+                w3, account,
+                gacha.functions.getGachaResult(),
+                value=0,
+                action=f"[{addr_cs[:8]}] getGachaResult({label},{'batch' if is_batch else 'single'})",
+                gas_multiplier=gas_multiplier,
+            )
+            result_receipt = await _get_receipt(w3, result_hash)
+            result_gas = _get_gas_cost_from_receipt(dict(result_receipt)) if result_receipt else 0
+            _inc_press_a_stats(eoa_address, eth_gas_wei=result_gas)
+            if result_receipt:
+                grades = _parse_all_grades_from_receipt(dict(result_receipt))
+                if grades:
+                    grade_names = [GRADE_NAMES.get(g, str(g)) for g in grades]
+                    logger.info(f"[{addr_cs[:8]}] {label} grades: {grade_names}")
+                if GRADE_UNIQUE in grades:
+                    logger.success(f"[{addr_cs[:8]}] UNIQUE выпал при {label} спине!")
+                    return True
+        return False
+    except Exception as e:
+        logger.warning(f"[{addr_cs[:8]}] {label} spin ошибка: {e} — пропуск")
+        return False
+
+
+async def _pre_spin_best_tickets(
+    w3,
+    account,
+    addr_cs: str,
+    eoa_address: str,
+    *,
+    gacha,
+    game_nft,
+    gas_multiplier: float,
+) -> bool:
+    """
+    Пытается получить Unique до «тяжёлого» флоу, тратя имеющиеся тикеты по приоритету:
+      Gold → Shell → Stone (LFG/Degen/Alpha/Hodler/Ape).
+    Возвращает True если выпал Unique.
+    """
+    try:
+        gold = int(await game_nft.functions.balanceOf(addr_cs, TOKEN_GOLD).call())
+        shell = int(await game_nft.functions.balanceOf(addr_cs, TOKEN_SHELL).call())
+        stone = int(await game_nft.functions.balanceOf(addr_cs, TOKEN_STONE).call())
+    except Exception as e:
+        logger.warning(f"[{addr_cs[:8]}] balanceOf тикетов ошибка: {e}")
+        return False
+
+    if gold <= 0 and shell <= 0 and stone <= 0:
+        return False
+
+    logger.info(f"[{addr_cs[:8]}] Тикеты перед циклом: Gold={gold}, Shell={shell}, Stone={stone}")
+
+    # Внутренний цикл: пробуем тратить тикеты, пока есть подходящие комбинации
+    while True:
+        # Gold
+        if gold >= 10:
+            if await _spin_by_tickets(
+                w3, account, addr_cs, eoa_address,
+                gacha=gacha,
+                tier_index=LFG_TIER_INDEX,
+                is_batch=True,
+                count_spins=10,
+                vrf_required=True,
+                gas_multiplier=gas_multiplier,
+                label="Gold/LFG",
+            ):
+                return True
+            gold -= 10
+            await _action_delay()
+            continue
+        if gold >= 1:
+            if await _spin_by_tickets(
+                w3, account, addr_cs, eoa_address,
+                gacha=gacha,
+                tier_index=DEGEN_TIER_INDEX,
+                is_batch=False,
+                count_spins=1,
+                vrf_required=True,
+                gas_multiplier=gas_multiplier,
+                label="Gold/Degen",
+            ):
+                return True
+            gold -= 1
+            await _action_delay()
+            continue
+
+        # Shell
+        if shell >= 5:
+            if await _spin_by_tickets(
+                w3, account, addr_cs, eoa_address,
+                gacha=gacha,
+                tier_index=ALPHA_TIER_INDEX,
+                is_batch=False,
+                count_spins=1,
+                vrf_required=True,
+                gas_multiplier=gas_multiplier,
+                label="Shell/Alpha",
+            ):
+                return True
+            shell -= 5
+            await _action_delay()
+            continue
+        if shell >= 1:
+            if await _spin_by_tickets(
+                w3, account, addr_cs, eoa_address,
+                gacha=gacha,
+                tier_index=HODLER_TIER_INDEX,
+                is_batch=False,
+                count_spins=1,
+                vrf_required=True,
+                gas_multiplier=gas_multiplier,
+                label="Shell/Hodler",
+            ):
+                return True
+            shell -= 1
+            await _action_delay()
+            continue
+
+        # Stone
+        if stone >= 10:
+            if await _spin_by_tickets(
+                w3, account, addr_cs, eoa_address,
+                gacha=gacha,
+                tier_index=APE_TIER_INDEX,
+                is_batch=True,
+                count_spins=10,
+                vrf_required=False,
+                gas_multiplier=gas_multiplier,
+                label="Stone/Ape",
+            ):
+                return True
+            stone -= 10
+            await _action_delay()
+            continue
+        if stone >= 1:
+            if await _spin_by_tickets(
+                w3, account, addr_cs, eoa_address,
+                gacha=gacha,
+                tier_index=APE_TIER_INDEX,
+                is_batch=False,
+                count_spins=1,
+                vrf_required=False,
+                gas_multiplier=gas_multiplier,
+                label="Stone/Ape",
+            ):
+                return True
+            stone -= 1
+            await _action_delay()
+            continue
+
+        break
+
+    return False
+
+
 async def _sell_all_items(
     w3,
     account,
@@ -1018,6 +1225,7 @@ async def _run_press_a_session(
     usdsc_max_raw = cfg.get("press_a_usdsc_max_raw", DEFAULT_USDSC_MAX_RAW)
     rug_target    = cfg.get("press_a_rug_target",    DEFAULT_RUG_TARGET)
     max_cycles    = cfg.get("press_a_max_cycles",    DEFAULT_MAX_CYCLES)
+    checkin_only  = bool(cfg.get("press_a_checkin_only", False))
 
     w3 = get_w3(rpc_url, proxy=proxy, disable_ssl=disable_ssl)
     try:
@@ -1028,6 +1236,36 @@ async def _run_press_a_session(
         sale     = w3.eth.contract(address=AsyncWeb3.to_checksum_address(SALE_UPGRADE_CONTRACT), abi=SALE_ABI)
         game_nft = w3.eth.contract(address=AsyncWeb3.to_checksum_address(GAME_NFT_CONTRACT),     abi=GAME_NFT_ABI)
         usdsc    = w3.eth.contract(address=AsyncWeb3.to_checksum_address(USDSC_ADDRESS),         abi=USDSC_ABI)
+
+        # ── Режим: только checkIn (без bootstrap/spin/sell) ───────────────────
+        if checkin_only:
+            try:
+                done_api = await asyncio.to_thread(check_press_a_done, eoa_address)
+                if done_api is True:
+                    logger.info(f"[{eoa_address[:8]}] Press A Unique уже получен (portal) — checkIn не требуется")
+                    return True
+            except Exception as e:
+                logger.warning(f"[{eoa_address[:8]}] Portal check_press_a_done ошибка: {e} — продолжаем checkIn")
+
+            try:
+                can_check = await gacha.functions.canCheckIn(addr_cs).call()
+                if can_check:
+                    await send_contract_tx(
+                        w3, account,
+                        gacha.functions.checkIn(),
+                        value=0,
+                        action=f"[{eoa_address[:8]}] checkIn",
+                        gas_multiplier=gas_multiplier,
+                    )
+                    ci_state = await gacha.functions.checkInStates(addr_cs).call()
+                    logger.success(f"[{eoa_address[:8]}] checkIn выполнен: count={ci_state[1]}")
+                else:
+                    ci_state = await gacha.functions.checkInStates(addr_cs).call()
+                    logger.info(f"[{eoa_address[:8]}] checkIn уже выполнен (count={ci_state[1]})")
+            except Exception as e:
+                logger.warning(f"[{eoa_address[:8]}] checkIn ошибка: {e}")
+
+            return True
 
         # ── Обработка pending VRF из предыдущего запуска ─────────────────────
         status = await _get_gacha_status(gacha, addr_cs)
@@ -1075,8 +1313,21 @@ async def _run_press_a_session(
         except Exception as e:
             logger.warning(f"[{eoa_address[:8]}] checkIn ошибка: {e}")
 
-        # ── 2. Approvals ──────────────────────────────────────────────────────
+        # ── 2. Approvals (нужны для списания тикетов/Sale) ────────────────────
         await _ensure_game_nft_approvals(w3, account, addr_cs, gas_multiplier)
+
+        # ── 2.1 Pre-spin (Gold → Shell → Stone) ──────────────────────────────
+        try:
+            if await _pre_spin_best_tickets(
+                w3, account, addr_cs, eoa_address,
+                gacha=gacha,
+                game_nft=game_nft,
+                gas_multiplier=gas_multiplier,
+            ):
+                db.upsert_account(eoa_address, press_a_done=True)
+                return True
+        except Exception as e:
+            logger.warning(f"[{eoa_address[:8]}] Pre-spin тикетов ошибка: {e} — продолжаем основной цикл")
 
         # ── 3. USDSC check + swap ─────────────────────────────────────────────
         usdsc_bal = await _get_usdsc_balance(usdsc, addr_cs)
@@ -1197,7 +1448,8 @@ def run_press_a_for_account(
         return True
 
     acc = db.get_account_info(eoa_address) or {}
-    if acc.get("press_a_done"):
+    checkin_only = bool((config or {}).get("press_a_checkin_only", False))
+    if (not checkin_only) and acc.get("press_a_done"):
         logger.info(f"[{eoa_address[:8]}] Press A Unique уже получен (db)")
         return True
 

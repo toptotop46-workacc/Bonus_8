@@ -602,10 +602,12 @@ async def _open_portal(cdp_endpoint: str, eoa_address: str) -> None:
             logger.success('Нажата "Try gasless action"')
             startale_popup = await startale_popup_info.value
             await startale_popup.wait_for_load_state("domcontentloaded", timeout=15000)
-            approve_gasless = startale_popup.get_by_role("button", name="Approve")
-            await approve_gasless.wait_for(state="visible", timeout=30000)
-            await approve_gasless.click()
-            logger.success("Approve gasless-транзакции")
+            send_btn = startale_popup.get_by_role("button", name="Send")
+            await send_btn.wait_for(state="visible", timeout=30000)
+            await send_btn.click()
+            logger.success("Нажата Send в модальном окне gasless")
+            await startale_popup.locator('[role="dialog"]').first.wait_for(state="hidden", timeout=60000)
+            logger.success("Модальное окно gasless закрылось")
         else:
             logger.info("Смарт-аккаунт уже создан, пропускаем Try gasless")
     finally:
