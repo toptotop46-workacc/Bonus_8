@@ -1261,7 +1261,7 @@ async def _run_press_a_session(
                     logger.success(f"[{eoa_address[:8]}] checkIn выполнен: count={ci_state[1]}")
                 else:
                     ci_state = await gacha.functions.checkInStates(addr_cs).call()
-                    logger.info(f"[{eoa_address[:8]}] checkIn уже выполнен (count={ci_state[1]})")
+                    logger.info(f"[{eoa_address[:8]}] checkIn сегодня выполнен (count={ci_state[1]})")
             except Exception as e:
                 logger.warning(f"[{eoa_address[:8]}] checkIn ошибка: {e}")
 
@@ -1469,9 +1469,11 @@ def run_press_a_for_account(
                 config=config,
             )
         )
-        if got_unique:
+        if got_unique and (not checkin_only):
             db.upsert_account(eoa_address, press_a_done=True)
             logger.success(f"[{eoa_address[:8]}] Press A выполнен!")
+        elif checkin_only:
+            logger.info(f"[{eoa_address[:8]}] checkIn-only: выполнено")
         else:
             logger.info(f"[{eoa_address[:8]}] Unique не выпал, запустить снова")
         return got_unique
