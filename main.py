@@ -34,6 +34,7 @@ from modules.portal_api import (
     check_nekocat_gmeow_done,
     check_press_a_done,
 )
+from modules.proxy_utils import load_proxies_from_file, to_proxy_dict
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -85,29 +86,10 @@ def load_wallets() -> list[tuple[str, str]]:
 def load_proxies() -> list[Optional[str]]:
     """
     Загружает прокси из proxy.txt.
-    Форматы: http://user:pass@host:port, host:port, host:port:user:pass
+    Основной формат: IP:PORT:LOGIN:PASSWORD.
+    Также поддерживаются URL-прокси.
     """
-    path = PROJECT_ROOT / "proxy.txt"
-    if not path.exists():
-        return []
-    result = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("http://") or line.startswith("https://") or line.startswith("socks"):
-                result.append(line)
-                continue
-            # host:port или host:port:user:pass
-            parts = line.split(":")
-            if len(parts) == 2:
-                result.append(f"http://{parts[0]}:{parts[1]}")
-            elif len(parts) == 4:
-                result.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
-            else:
-                result.append(f"http://{line}")
-    return result
+    return load_proxies_from_file(PROJECT_ROOT / "proxy.txt")
 
 
 def load_adspower_key() -> Optional[str]:
@@ -245,7 +227,7 @@ def _run_single_task(
             logger.error(f"[{addr[:8]}] Нет firstmail #{i_orig+1}, пропуск")
             return True
         email, password = firstmail_pool[i_orig]
-        proxy_dict = {"http": proxy, "https": proxy} if proxy else None
+        proxy_dict = to_proxy_dict(proxy)
         logger.info(f"[{addr[:8]}] Startale GM (email: {email})")
         from modules.startale_gm import run_gm_for_account
         run_gm_for_account(pk, addr, adspower_key, proxy=proxy_dict,
@@ -259,7 +241,7 @@ def _run_single_task(
             logger.error(f"[{addr[:8]}] Нет firstmail #{i_orig+1}, пропуск")
             return True
         email, password = firstmail_pool[i_orig]
-        proxy_dict = {"http": proxy, "https": proxy} if proxy else None
+        proxy_dict = to_proxy_dict(proxy)
         logger.info(f"[{addr[:8]}] Kami (email: {email})")
         from modules.kami_browser import run_kami_browser_for_account
         run_kami_browser_for_account(

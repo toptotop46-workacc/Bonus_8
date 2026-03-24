@@ -15,11 +15,13 @@ from typing import List, Optional, Tuple
 
 from modules import logger, db
 from modules.portal_api import check_kami_week_done, get_kami_progress
+from modules.proxy_utils import build_proxy_chain, is_proxy_auth_error, load_proxies_from_file, proxy_dict_to_url, to_proxy_dict
 from modules.web3_utils import get_w3, get_account, erc20_balance_of, close_web3_provider
 from modules.lifi_swap import swap_eth_to_token
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIRSTMAIL_ACCOUNTS_FILE = PROJECT_ROOT / "firstmail_accounts.txt"
+PROXY_FILE = PROJECT_ROOT / "proxy.txt"
 
 RABBY_EXTENSION_ID = "acmacodkjbdgmoleebolmdjonilkdbch"
 
@@ -72,6 +74,17 @@ KAMI_PAY_WITH_SELECTORS = [
     'button[title="Wallet connected"]',
     'button:has-text("Pay with")',
 ]
+
+
+def _load_proxy_pool() -> list[str]:
+    return load_proxies_from_file(PROXY_FILE)
+
+
+def _iter_proxy_dicts(initial_proxy: Optional[dict]) -> list[Optional[dict]]:
+    proxy_chain = build_proxy_chain(proxy_dict_to_url(initial_proxy), _load_proxy_pool())
+    if not proxy_chain:
+        return [None]
+    return [to_proxy_dict(proxy_url) for proxy_url in proxy_chain]
 
 
 async def _ensure_usdce_balance(
@@ -1001,10 +1014,14 @@ async def _kami_purchase_flow(page, context, cfg: dict) -> bool:
     return purchase_ok
 
 
-def _sync_kami_weeks_to_db(eoa_address: str, proxy_dict: Optional[dict]) -> None:
+def _sync_kami_weeks_to_db(
+    eoa_address: str,
+    proxy_dict: Optional[dict],
+    proxy_pool: Optional[list[str]] = None,
+) -> None:
     """Читает прогресс Kami из портала и сохраняет в quest_results.json."""
     try:
-        quests = get_kami_progress(eoa_address, proxies=proxy_dict)
+        quests = get_kami_progress(eoa_address, proxies=proxy_dict, proxy_pool=proxy_pool)
         if not quests:
             return
         weeks_done = [q["isDone"] for q in quests]
@@ -1036,25 +1053,9 @@ def run_kami_browser_for_account(
     """
     Один аккаунт: проверка портала → добор USDC.E через LI.FI при нехватке → браузер (AdsPower + Playwright).
     """
-    # 1) Проверка портала — week1 уже выполнен?
-    if proxy_dict:
-        done = check_kami_week_done(eoa_address, week=1, proxies=proxy_dict)
-    else:
-        done = check_kami_week_done(eoa_address, week=1)
-    if done is True:
-        logger.info(f"[{eoa_address}] Kami week1 уже выполнен по порталу, пропуск")
-        _sync_kami_weeks_to_db(eoa_address, proxy_dict)
-        return
-    if done is None:
-        logger.warning(f"[{eoa_address}] Не удалось проверить портал, продолжаем")
-
-    # 2) Добор USDC.E через LI.FI при нехватке (логика как в старой Kami)
+    proxy_chain = _iter_proxy_dicts(proxy_dict)
+    proxy_pool = _load_proxy_pool()
     rpc_url = cfg.get("rpc_url") or "https://soneium-rpc.publicnode.com"
-    asyncio.run(
-        _ensure_usdce_balance(
-            rpc_url, private_key, eoa_address, cfg, proxy_dict, lifi_api_key,
-        )
-    )
 
     # 3) Браузерный флоу: AdsPower + Playwright
     from modules.startale_gm import (
@@ -1065,29 +1066,54 @@ def run_kami_browser_for_account(
         _get_cdp_endpoint,
     )
 
-    profile_id = None
-    try:
-        profile_id = _create_profile(adspower_api_key)
-        browser_data = _start_browser(adspower_api_key, profile_id)
-        cdp = _get_cdp_endpoint(browser_data)
-        if not cdp:
-            raise RuntimeError("AdsPower не вернул CDP endpoint")
-        logger.info(f"[{eoa_address}] Браузер запущен, выполняю флоу Kami...")
-        asyncio.run(
-            _run_kami_browser_async(
-                cdp, private_key, eoa_address, cfg,
-                firstmail_email=firstmail_email,
-                firstmail_password=firstmail_password or "",
+    for idx, proxy_candidate in enumerate(proxy_chain, start=1):
+        profile_id = None
+        try:
+            done = check_kami_week_done(
+                eoa_address,
+                week=1,
+                proxies=proxy_candidate,
+                proxy_pool=proxy_pool,
             )
-        )
-        _sync_kami_weeks_to_db(eoa_address, proxy_dict)
-    except Exception as e:
-        logger.warning(f"Kami browser: {e}")
-    finally:
-        if profile_id:
-            try:
-                logger.info("Kami: остановка браузера, удаление профиля AdsPower")
-                _stop_browser(adspower_api_key, profile_id)
-                _delete_profile(adspower_api_key, profile_id)
-            except Exception as e:
-                logger.warning(f"Kami cleanup: {e}")
+            if done is True:
+                logger.info(f"[{eoa_address}] Kami week1 уже выполнен по порталу, пропуск")
+                _sync_kami_weeks_to_db(eoa_address, proxy_candidate, proxy_pool)
+                return
+            if done is None:
+                logger.warning(f"[{eoa_address}] Не удалось проверить портал, продолжаем")
+
+            asyncio.run(
+                _ensure_usdce_balance(
+                    rpc_url, private_key, eoa_address, cfg, proxy_candidate, lifi_api_key,
+                )
+            )
+
+            profile_id = _create_profile(adspower_api_key)
+            browser_data = _start_browser(adspower_api_key, profile_id)
+            cdp = _get_cdp_endpoint(browser_data)
+            if not cdp:
+                raise RuntimeError("AdsPower не вернул CDP endpoint")
+            logger.info(f"[{eoa_address}] Браузер запущен, выполняю флоу Kami...")
+            asyncio.run(
+                _run_kami_browser_async(
+                    cdp, private_key, eoa_address, cfg,
+                    firstmail_email=firstmail_email,
+                    firstmail_password=firstmail_password or "",
+                )
+            )
+            _sync_kami_weeks_to_db(eoa_address, proxy_candidate, proxy_pool)
+            return
+        except Exception as e:
+            if proxy_candidate and is_proxy_auth_error(e) and idx < len(proxy_chain):
+                logger.warning(f"[{eoa_address}] Kami proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий")
+                continue
+            logger.warning(f"Kami browser: {e}")
+            return
+        finally:
+            if profile_id:
+                try:
+                    logger.info("Kami: остановка браузера, удаление профиля AdsPower")
+                    _stop_browser(adspower_api_key, profile_id)
+                    _delete_profile(adspower_api_key, profile_id)
+                except Exception as e:
+                    logger.warning(f"Kami cleanup: {e}")

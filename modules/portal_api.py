@@ -20,6 +20,13 @@ from typing import Any, List, Optional
 import requests
 from tqdm import tqdm
 
+from modules.proxy_utils import (
+    build_proxy_chain,
+    is_proxy_auth_error,
+    proxy_dict_to_url,
+    to_proxy_dict,
+)
+
 SONEIUM_BONUS_URL = "https://portal.soneium.org/api/profile/bonus-dapp"
 
 # Точные ID дапп для Season 8
@@ -50,21 +57,39 @@ def _get_headers() -> dict:
     }
 
 
-def get_bonus_dapp_data(address: str, proxies: Optional[dict] = None) -> Optional[List[Any]]:
+def get_bonus_dapp_data(
+    address: str,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> Optional[List[Any]]:
     """
     Запрашивает список dapp-объектов для адреса.
     Возвращает список или None при ошибке.
     """
     url = f"{SONEIUM_BONUS_URL}?address={address}"
-    try:
-        r = requests.get(url, headers=_get_headers(), proxies=proxies, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
+    proxy_chain = build_proxy_chain(proxy_dict_to_url(proxies), proxy_pool or [])
+    if not proxy_chain:
+        proxy_chain = [None]
+
+    last_error: Optional[Exception] = None
+    for idx, proxy_url in enumerate(proxy_chain, start=1):
+        proxy_dict = to_proxy_dict(proxy_url)
+        try:
+            r = requests.get(url, headers=_get_headers(), proxies=proxy_dict, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                return data
+            return None
+        except Exception as exc:
+            last_error = exc
+            if proxy_url and is_proxy_auth_error(exc) and idx < len(proxy_chain):
+                continue
+            return None
+
+    if last_error:
         return None
-    if not isinstance(data, list):
-        return None
-    return data
+    return None
 
 
 def _get_dapp(data: List[Any], dapp_id: str) -> Optional[dict]:
@@ -86,9 +111,13 @@ def _find_quest_in_dapp(dapp: dict, text: str) -> Optional[dict]:
 
 # ── Startale (Season 8: startale_8) ────────────────────────────────────────
 
-def check_startale_passkey_quest_done(address: str, proxies: Optional[dict] = None) -> Optional[bool]:
+def check_startale_passkey_quest_done(
+    address: str,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> Optional[bool]:
     """«Set up Passkey or social recovery» → True/False/None."""
-    data = get_bonus_dapp_data(address, proxies)
+    data = get_bonus_dapp_data(address, proxies, proxy_pool=proxy_pool)
     if data is None:
         return None
     dapp = _get_dapp(data, DAPP_STARTALE)
@@ -98,9 +127,13 @@ def check_startale_passkey_quest_done(address: str, proxies: Optional[dict] = No
     return bool(q.get("isDone")) if q else False
 
 
-def check_startale_gm_5_done(address: str, proxies: Optional[dict] = None) -> Optional[bool]:
+def check_startale_gm_5_done(
+    address: str,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> Optional[bool]:
     """«Send Daily GM 5 times» → True/False/None."""
-    data = get_bonus_dapp_data(address, proxies)
+    data = get_bonus_dapp_data(address, proxies, proxy_pool=proxy_pool)
     if data is None:
         return None
     dapp = _get_dapp(data, DAPP_STARTALE)
@@ -110,9 +143,13 @@ def check_startale_gm_5_done(address: str, proxies: Optional[dict] = None) -> Op
     return bool(q.get("isDone")) if q else False
 
 
-def get_startale_gm_progress(address: str, proxies: Optional[dict] = None) -> tuple[int, int]:
+def get_startale_gm_progress(
+    address: str,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> tuple[int, int]:
     """Возвращает (completed, required) прогресс по GM квесту."""
-    data = get_bonus_dapp_data(address, proxies)
+    data = get_bonus_dapp_data(address, proxies, proxy_pool=proxy_pool)
     if data is None:
         return (0, 5)
     dapp = _get_dapp(data, DAPP_STARTALE)
@@ -126,9 +163,14 @@ def get_startale_gm_progress(address: str, proxies: Optional[dict] = None) -> tu
 
 # ── Kami (Season 8: kami_8) ────────────────────────────────────────────────
 
-def check_kami_week_done(address: str, week: int, proxies: Optional[dict] = None) -> Optional[bool]:
+def check_kami_week_done(
+    address: str,
+    week: int,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> Optional[bool]:
     """Проверяет выполнение Kami puzzle piece для конкретной недели → True/False/None."""
-    data = get_bonus_dapp_data(address, proxies)
+    data = get_bonus_dapp_data(address, proxies, proxy_pool=proxy_pool)
     if data is None:
         return None
     dapp = _get_dapp(data, DAPP_KAMI)
@@ -138,9 +180,13 @@ def check_kami_week_done(address: str, week: int, proxies: Optional[dict] = None
     return bool(q.get("isDone")) if q else False
 
 
-def check_kami_done(address: str, proxies: Optional[dict] = None) -> Optional[bool]:
+def check_kami_done(
+    address: str,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> Optional[bool]:
     """Проверяет выполнены ли ВСЕ Kami quests → True/False/None."""
-    data = get_bonus_dapp_data(address, proxies)
+    data = get_bonus_dapp_data(address, proxies, proxy_pool=proxy_pool)
     if data is None:
         return None
     dapp = _get_dapp(data, DAPP_KAMI)
@@ -152,12 +198,16 @@ def check_kami_done(address: str, proxies: Optional[dict] = None) -> Optional[bo
     return all(bool(q.get("isDone")) for q in quests)
 
 
-def get_kami_progress(address: str, proxies: Optional[dict] = None) -> list[dict]:
+def get_kami_progress(
+    address: str,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> list[dict]:
     """
     Возвращает список квестов Kami с прогрессом:
     [{"desc": "Mint week 1 puzzle piece", "isDone": False, "completed": 0, "required": 1}, ...]
     """
-    data = get_bonus_dapp_data(address, proxies)
+    data = get_bonus_dapp_data(address, proxies, proxy_pool=proxy_pool)
     if data is None:
         return []
     dapp = _get_dapp(data, DAPP_KAMI)
@@ -220,9 +270,13 @@ def get_nekocat_progress(address: str, proxies: Optional[dict] = None) -> dict:
 
 # ── Press A (Season 8: pressa_8) ───────────────────────────────────────────
 
-def check_press_a_done(address: str, proxies: Optional[dict] = None) -> Optional[bool]:
+def check_press_a_done(
+    address: str,
+    proxies: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
+) -> Optional[bool]:
     """«Mint 1 Unique-grade NFT» → True/False/None."""
-    data = get_bonus_dapp_data(address, proxies)
+    data = get_bonus_dapp_data(address, proxies, proxy_pool=proxy_pool)
     if data is None:
         return None
     dapp = _get_dapp(data, DAPP_PRESSA)
@@ -302,7 +356,7 @@ def fetch_portal_data_batch(
     def _fetch_one(address: str) -> tuple[str, Optional[List[Any]]]:
         proxy_url = random.choice(proxy_urls) if proxy_urls else None
         proxy_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        return address, get_bonus_dapp_data(address, proxy_dict)
+        return address, get_bonus_dapp_data(address, proxy_dict, proxy_pool=proxy_urls)
 
     # Обрабатываем батчами чтобы не открывать сотни соединений разом
     with tqdm(total=len(addresses), desc="Portal статус", unit="wallet",

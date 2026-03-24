@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
 from web3 import AsyncWeb3
 
 from modules import logger
+from modules.proxy_utils import build_proxy_chain, is_proxy_auth_error, load_proxies_from_file
 from modules.web3_utils import get_nonce, send_tx, send_contract_tx
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROXY_FILE = PROJECT_ROOT / "proxy.txt"
 
 LIFI_QUOTE_URL = "https://li.quest/v1/quote"
 SONEIUM_CHAIN_ID = 1868
@@ -66,19 +71,39 @@ async def _lifi_quote(
     if lifi_api_key:
         headers["x-lifi-api-key"] = lifi_api_key
 
-    session, proxy_url = await _get_session(proxy)
-    async with session:
-        async with session.get(
-            LIFI_QUOTE_URL,
-            params=params,
-            headers=headers,
-            proxy=proxy_url,
-            ssl=False,
-        ) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"LI.FI API ошибка {resp.status}: {text[:300]}")
-            return await resp.json()
+    proxy_chain = build_proxy_chain(proxy, load_proxies_from_file(PROXY_FILE))
+    if not proxy_chain:
+        proxy_chain = [None]
+
+    last_error: Optional[Exception] = None
+    for idx, proxy_candidate in enumerate(proxy_chain, start=1):
+        session, proxy_url = await _get_session(proxy_candidate)
+        try:
+            async with session:
+                async with session.get(
+                    LIFI_QUOTE_URL,
+                    params=params,
+                    headers=headers,
+                    proxy=proxy_url,
+                    ssl=False,
+                ) as resp:
+                    if resp.status == 407 and proxy_candidate and idx < len(proxy_chain):
+                        logger.warning(f"LI.FI proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий")
+                        continue
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise RuntimeError(f"LI.FI API ошибка {resp.status}: {text[:300]}")
+                    return await resp.json()
+        except Exception as exc:
+            last_error = exc
+            if proxy_candidate and is_proxy_auth_error(exc) and idx < len(proxy_chain):
+                logger.warning(f"LI.FI proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий")
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("LI.FI: не удалось получить quote")
 
 
 async def _build_and_send(

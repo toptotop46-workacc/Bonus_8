@@ -48,4 +48,4 @@ press_a_rug_target = 200
 press_a_max_cycles = 10
 # Режим только ежедневного check-in (для накопления наград), без bootstrap/spin/sell
 # ВАЖНО: если Unique уже засчитан на портале — check-in не выполняется
-press_a_checkin_only = false   # по умолчанию выключено; чтобы включить — выставь true
+press_a_checkin_only = true   # по умолчанию включено; чтобы выключить — выставь false

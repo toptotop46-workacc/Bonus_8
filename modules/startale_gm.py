@@ -32,6 +32,13 @@ from modules.portal_api import (
     check_startale_passkey_quest_done,
     get_startale_gm_progress,
 )
+from modules.proxy_utils import (
+    build_proxy_chain,
+    is_proxy_auth_error,
+    load_proxies_from_file,
+    proxy_dict_to_url,
+    to_proxy_dict,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROXY_FILE = PROJECT_ROOT / "proxy.txt"
@@ -63,19 +70,38 @@ FALLBACK_GM_COOLDOWN_MINUTES = 60
 
 def _load_random_proxy() -> Optional[dict]:
     """Загружает proxy.txt и возвращает случайный прокси для requests (или None)."""
-    if not PROXY_FILE.exists():
+    proxy_urls = load_proxies_from_file(PROXY_FILE)
+    if not proxy_urls:
         return None
-    lines = []
-    with open(PROXY_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                parts = line.split(":")
-                if len(parts) >= 4:
-                    ip, port, user, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
-                    proxy_url = f"http://{user}:{password}@{ip}:{port}"
-                    lines.append({"http": proxy_url, "https": proxy_url})
-    return random.choice(lines) if lines else None
+    return to_proxy_dict(random.choice(proxy_urls))
+
+
+def _load_proxy_pool() -> list[str]:
+    return load_proxies_from_file(PROXY_FILE)
+
+
+def _iter_proxy_dicts(initial_proxy: Optional[dict]) -> list[Optional[dict]]:
+    proxy_chain = build_proxy_chain(proxy_dict_to_url(initial_proxy), _load_proxy_pool())
+    if not proxy_chain:
+        return [None]
+    return [to_proxy_dict(proxy_url) for proxy_url in proxy_chain]
+
+
+def _run_proxy_rotation(label: str, initial_proxy: Optional[dict], runner):
+    proxy_chain = _iter_proxy_dicts(initial_proxy)
+    last_error: Optional[Exception] = None
+    for idx, proxy_dict in enumerate(proxy_chain, start=1):
+        try:
+            return runner(proxy_dict)
+        except Exception as exc:
+            last_error = exc
+            if proxy_dict and is_proxy_auth_error(exc) and idx < len(proxy_chain):
+                logger.warning(f"{label}: proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий")
+                continue
+            raise
+    if last_error:
+        raise last_error
+    return runner(None)
 
 
 # ── AdsPower helpers ─────────────────────────────────────────────────────────
@@ -171,6 +197,8 @@ def check_smart_account_exists(eoa_address: str, proxies: Optional[dict] = None)
             return False
         return r.ok
     except Exception as e:
+        if is_proxy_auth_error(e):
+            raise
         logger.warning(f"Проверка profile/mapping не удалась: {e}")
         return False
 
@@ -227,34 +255,37 @@ async def _human_like_click(page, locator, timeout: int = 15000) -> None:
 
 def get_disposable_email(proxies: Optional[dict] = None) -> str:
     """Создаёт временный аккаунт mail.tm и возвращает email."""
-    r = requests.get(
-        f"{MAILTM_BASE}/domains",
-        headers={"Accept": "application/json"},
-        proxies=proxies,
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and "hydra:member" in data:
-        domains = data["hydra:member"]
-    elif isinstance(data, list):
-        domains = data
-    else:
-        raise ValueError("Неверный ответ mail.tm/domains")
-    if not domains:
-        raise ValueError("Нет доступных доменов mail.tm")
-    domain = domains[0].get("domain") if isinstance(domains[0], dict) else domains[0]
-    local = f"startale_{uuid.uuid4().hex[:12]}"
-    address = f"{local}@{domain}"
-    create = requests.post(
-        f"{MAILTM_BASE}/accounts",
-        json={"address": address, "password": MAILTM_PASSWORD},
-        headers={"Content-Type": "application/json"},
-        proxies=proxies,
-        timeout=15,
-    )
-    create.raise_for_status()
-    return address
+    def _create(proxy_dict: Optional[dict]) -> str:
+        r = requests.get(
+            f"{MAILTM_BASE}/domains",
+            headers={"Accept": "application/json"},
+            proxies=proxy_dict,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and "hydra:member" in data:
+            domains = data["hydra:member"]
+        elif isinstance(data, list):
+            domains = data
+        else:
+            raise ValueError("Неверный ответ mail.tm/domains")
+        if not domains:
+            raise ValueError("Нет доступных доменов mail.tm")
+        domain = domains[0].get("domain") if isinstance(domains[0], dict) else domains[0]
+        local = f"startale_{uuid.uuid4().hex[:12]}"
+        address = f"{local}@{domain}"
+        create = requests.post(
+            f"{MAILTM_BASE}/accounts",
+            json={"address": address, "password": MAILTM_PASSWORD},
+            headers={"Content-Type": "application/json"},
+            proxies=proxy_dict,
+            timeout=15,
+        )
+        create.raise_for_status()
+        return address
+
+    return _run_proxy_rotation("mail.tm create account", proxies, _create)
 
 
 def fetch_verification_link_from_inbox(
@@ -269,49 +300,55 @@ def fetch_verification_link_from_inbox(
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            token_r = requests.post(
-                f"{MAILTM_BASE}/token",
-                json={"address": email, "password": MAILTM_PASSWORD},
-                headers={"Content-Type": "application/json"},
-                proxies=proxies,
-                timeout=15,
-            )
-            token_r.raise_for_status()
-            token = token_r.json().get("token")
-            if not token:
-                raise ValueError("Нет token в ответе")
-            msg_list = requests.get(
-                f"{MAILTM_BASE}/messages",
-                headers={"Authorization": f"Bearer {token}"},
-                proxies=proxies,
-                timeout=15,
-            )
-            msg_list.raise_for_status()
-            messages = msg_list.json()
-            if isinstance(messages, dict) and "hydra:member" in messages:
-                messages = messages["hydra:member"]
-            elif not isinstance(messages, list):
-                messages = []
-            for msg in messages:
-                msg_id = msg.get("id") if isinstance(msg, dict) else msg
-                if not msg_id:
-                    continue
-                read_r = requests.get(
-                    f"{MAILTM_BASE}/messages/{msg_id}",
-                    headers={"Authorization": f"Bearer {token}"},
-                    proxies=proxies,
+            def _poll_mail(proxy_dict: Optional[dict]) -> Optional[str]:
+                token_r = requests.post(
+                    f"{MAILTM_BASE}/token",
+                    json={"address": email, "password": MAILTM_PASSWORD},
+                    headers={"Content-Type": "application/json"},
+                    proxies=proxy_dict,
                     timeout=15,
                 )
-                read_r.raise_for_status()
-                data = read_r.json()
-                html = data.get("html")
-                if isinstance(html, list):
-                    body = " ".join(html)
-                else:
-                    body = str(html or data.get("htmlBody") or data.get("body") or data.get("text") or "")
-                match = BITWARDEN_VERIFY_LINK_RE.search(body)
-                if match:
-                    return match.group(0).rstrip("&>'\"")
+                token_r.raise_for_status()
+                token = token_r.json().get("token")
+                if not token:
+                    raise ValueError("Нет token в ответе")
+                msg_list = requests.get(
+                    f"{MAILTM_BASE}/messages",
+                    headers={"Authorization": f"Bearer {token}"},
+                    proxies=proxy_dict,
+                    timeout=15,
+                )
+                msg_list.raise_for_status()
+                messages = msg_list.json()
+                if isinstance(messages, dict) and "hydra:member" in messages:
+                    messages = messages["hydra:member"]
+                elif not isinstance(messages, list):
+                    messages = []
+                for msg in messages:
+                    msg_id = msg.get("id") if isinstance(msg, dict) else msg
+                    if not msg_id:
+                        continue
+                    read_r = requests.get(
+                        f"{MAILTM_BASE}/messages/{msg_id}",
+                        headers={"Authorization": f"Bearer {token}"},
+                        proxies=proxy_dict,
+                        timeout=15,
+                    )
+                    read_r.raise_for_status()
+                    data = read_r.json()
+                    html = data.get("html")
+                    if isinstance(html, list):
+                        body = " ".join(html)
+                    else:
+                        body = str(html or data.get("htmlBody") or data.get("body") or data.get("text") or "")
+                    match = BITWARDEN_VERIFY_LINK_RE.search(body)
+                    if match:
+                        return match.group(0).rstrip("&>'\"")
+                return None
+
+            match_link = _run_proxy_rotation("mail.tm poll inbox", proxies, _poll_mail)
+            if match_link:
+                return match_link
         except Exception as e:
             logger.info(f"Опрос почты: {e}")
         time.sleep(poll_interval)
@@ -373,10 +410,16 @@ async def _wait_quest_done_then_unbind_passkey(page, wallet_address: str, interv
     """Опрашивает портал каждые interval_sec сек; при засчитывании квеста отвязывает passkey."""
     logger.info(f"Ожидание засчитывания passkey-квеста (опрос каждые {interval_sec} сек)...")
     deadline = time.time() + PASSKEY_POLL_TIMEOUT_SEC
+    proxy_pool = _load_proxy_pool()
     while time.time() < deadline:
         try:
             proxies = _load_random_proxy()
-            done = await asyncio.to_thread(check_startale_passkey_quest_done, wallet_address, proxies)
+            done = await asyncio.to_thread(
+                check_startale_passkey_quest_done,
+                wallet_address,
+                proxies,
+                proxy_pool,
+            )
             if done:
                 break
         except Exception as e:
@@ -941,86 +984,89 @@ def run_gm_for_account(
     firstmail_email/password — постоянный email для Bitwarden (вместо разового mail.tm).
     """
     db.init_db()
+    proxy_chain = _iter_proxy_dicts(proxy)
+    proxy_pool = _load_proxy_pool()
 
-    # ── Проверка passkey ──────────────────────────────────────────────────────
-    acc = db.get_account_info(eoa_address)
-    passkey_done = bool((acc or {}).get("passkey_done"))
-    if not passkey_done:
-        api_passkey = check_startale_passkey_quest_done(eoa_address, proxy)
-        if api_passkey is True:
-            passkey_done = True
-            db.upsert_account(eoa_address, passkey_done=True)
+    for idx, proxy_candidate in enumerate(proxy_chain, start=1):
+        # ── Проверка passkey ──────────────────────────────────────────────────
+        acc = db.get_account_info(eoa_address)
+        passkey_done = bool((acc or {}).get("passkey_done"))
+        if not passkey_done:
+            api_passkey = check_startale_passkey_quest_done(eoa_address, proxy_candidate, proxy_pool)
+            if api_passkey is True:
+                passkey_done = True
+                db.upsert_account(eoa_address, passkey_done=True)
 
-    # ── Проверка GM ───────────────────────────────────────────────────────────
-    gm_5_done = check_startale_gm_5_done(eoa_address, proxy)
-    if gm_5_done is True:
-        db.upsert_account(eoa_address, gm_done=True)
-
-    gm_needed = (gm_5_done is not True) and db.is_gm_needed_now(eoa_address)
-    if not gm_needed and gm_5_done is not True:
-        rec = db.get_account_info(eoa_address)
-        next_at_str = (rec or {}).get("next_gm_available_at", "?")
-        logger.info(f"[{eoa_address}] GM cooldown до {next_at_str}")
-
-    # ── Пропуск если оба выполнены ────────────────────────────────────────────
-    if passkey_done and not gm_needed:
+        # ── Проверка GM ───────────────────────────────────────────────────────
+        gm_5_done = check_startale_gm_5_done(eoa_address, proxy_candidate, proxy_pool)
         if gm_5_done is True:
-            logger.info(f"[{eoa_address}] Passkey и GM уже выполнены, пропуск")
-        else:
-            logger.info(f"[{eoa_address}] Passkey выполнен, GM на cooldown, пропуск")
-        return True
+            db.upsert_account(eoa_address, gm_done=True)
 
-    cur, req = get_startale_gm_progress(eoa_address, proxy)
-    logger.info(f"[{eoa_address}] GM прогресс: {cur}/{req} | passkey: {passkey_done} | запускаем браузер...")
+        gm_needed = (gm_5_done is not True) and db.is_gm_needed_now(eoa_address)
+        if not gm_needed and gm_5_done is not True:
+            rec = db.get_account_info(eoa_address)
+            next_at_str = (rec or {}).get("next_gm_available_at", "?")
+            logger.info(f"[{eoa_address}] GM cooldown до {next_at_str}")
 
-    profile_id = None
-    try:
-        profile_id = _create_profile(adspower_api_key)
-        logger.info(f"[{eoa_address}] Профиль создан: {profile_id}")
-        browser_info = _start_browser(adspower_api_key, profile_id)
-        time.sleep(5)
+        if passkey_done and not gm_needed:
+            if gm_5_done is True:
+                logger.info(f"[{eoa_address}] Passkey и GM уже выполнены, пропуск")
+            else:
+                logger.info(f"[{eoa_address}] Passkey выполнен, GM на cooldown, пропуск")
+            return True
 
-        cdp = _get_cdp_endpoint(browser_info)
-        if not cdp:
-            raise RuntimeError("Не удалось получить CDP endpoint от AdsPower")
-        logger.info(f"[{eoa_address}] CDP: {cdp}")
+        cur, req = get_startale_gm_progress(eoa_address, proxy_candidate, proxy_pool)
+        logger.info(f"[{eoa_address}] GM прогресс: {cur}/{req} | passkey: {passkey_done} | запускаем браузер...")
 
-        # Шаг 1: импорт кошелька
-        asyncio.run(_import_wallet(cdp, private_key))
+        profile_id = None
+        try:
+            profile_id = _create_profile(adspower_api_key)
+            logger.info(f"[{eoa_address}] Профиль создан: {profile_id}")
+            browser_info = _start_browser(adspower_api_key, profile_id)
+            time.sleep(5)
 
-        # Шаг 2: подключение к Startale + (опц.) passkey
-        has_smart = check_smart_account_exists(eoa_address, proxy)
-        db.upsert_account(eoa_address, smart_account_created=has_smart)
+            cdp = _get_cdp_endpoint(browser_info)
+            if not cdp:
+                raise RuntimeError("Не удалось получить CDP endpoint от AdsPower")
+            logger.info(f"[{eoa_address}] CDP: {cdp}")
 
-        if has_smart:
-            logger.info(f"[{eoa_address}] Смарт-аккаунт есть → log-in flow")
-            asyncio.run(_connect_startale(
-                cdp, eoa_address, do_passkey=not passkey_done,
-                firstmail_email=firstmail_email, firstmail_password=firstmail_password,
-            ))
-        else:
-            logger.info(f"[{eoa_address}] Смарт-аккаунт не создан → portal flow")
-            asyncio.run(_open_portal(cdp, eoa_address))
-            db.upsert_account(eoa_address, smart_account_created=True)
-            # После portal flow passkey ещё не выполнен — подключаемся через log-in
-            if not passkey_done:
+            asyncio.run(_import_wallet(cdp, private_key))
+
+            has_smart = check_smart_account_exists(eoa_address, proxy_candidate)
+            db.upsert_account(eoa_address, smart_account_created=has_smart)
+
+            if has_smart:
+                logger.info(f"[{eoa_address}] Смарт-аккаунт есть → log-in flow")
                 asyncio.run(_connect_startale(
-                    cdp, eoa_address, do_passkey=True,
+                    cdp, eoa_address, do_passkey=not passkey_done,
                     firstmail_email=firstmail_email, firstmail_password=firstmail_password,
                 ))
+            else:
+                logger.info(f"[{eoa_address}] Смарт-аккаунт не создан → portal flow")
+                asyncio.run(_open_portal(cdp, eoa_address))
+                db.upsert_account(eoa_address, smart_account_created=True)
+                if not passkey_done:
+                    asyncio.run(_connect_startale(
+                        cdp, eoa_address, do_passkey=True,
+                        firstmail_email=firstmail_email, firstmail_password=firstmail_password,
+                    ))
 
-        # Шаг 3: GM (если нужен)
-        if gm_needed:
-            asyncio.run(_do_gm_on_existing(cdp, eoa_address))
+            if gm_needed:
+                asyncio.run(_do_gm_on_existing(cdp, eoa_address))
 
-        if firstmail_email and not passkey_done:
-            db.upsert_account(eoa_address, passkey_email=firstmail_email)
-        logger.success(f"[{eoa_address}] Сессия завершена")
-        return True
-    except Exception as e:
-        logger.error(f"[{eoa_address}] Ошибка: {e}")
-        return False
-    finally:
-        if profile_id:
-            _stop_browser(adspower_api_key, profile_id)
-            _delete_profile(adspower_api_key, profile_id)
+            if firstmail_email and not passkey_done:
+                db.upsert_account(eoa_address, passkey_email=firstmail_email)
+            logger.success(f"[{eoa_address}] Сессия завершена")
+            return True
+        except Exception as e:
+            if proxy_candidate and is_proxy_auth_error(e) and idx < len(proxy_chain):
+                logger.warning(f"[{eoa_address}] Startale proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий")
+                continue
+            logger.error(f"[{eoa_address}] Ошибка: {e}")
+            return False
+        finally:
+            if profile_id:
+                _stop_browser(adspower_api_key, profile_id)
+                _delete_profile(adspower_api_key, profile_id)
+
+    return False

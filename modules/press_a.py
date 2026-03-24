@@ -36,13 +36,18 @@ import asyncio
 import json
 import random
 import time
+from pathlib import Path
 from typing import Optional, Any
 
 import requests
 
 from modules import logger, db
+from modules.proxy_utils import build_proxy_chain, is_proxy_auth_error, load_proxies_from_file, to_proxy_dict
 from modules.web3_utils import get_w3, get_account, send_contract_tx, close_web3_provider
 from modules.portal_api import check_press_a_done
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROXY_FILE = PROJECT_ROOT / "proxy.txt"
 
 # ── Адреса контрактов ─────────────────────────────────────────────────────────
 
@@ -281,6 +286,14 @@ GAME_NFT_ABI = json.loads(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _raise_if_proxy_auth_error(exc: Exception) -> None:
+    if is_proxy_auth_error(exc):
+        raise exc
+
+
+def _load_proxy_pool() -> list[str]:
+    return load_proxies_from_file(PROXY_FILE)
+
 def _fmt_usdsc(amount: float) -> str:
     return f"{amount:.6f}".rstrip("0").rstrip(".") or "0"
 
@@ -387,6 +400,7 @@ async def _get_receipt(w3, tx_hash: str):
         tx_bytes = bytes.fromhex(tx_hash[2:] if tx_hash.startswith("0x") else tx_hash)
         return await w3.eth.get_transaction_receipt(tx_bytes)
     except Exception as e:
+        _raise_if_proxy_auth_error(e)
         logger.warning(f"Не удалось получить receipt: {e}")
         return None
 
@@ -396,6 +410,7 @@ async def _get_gacha_status(gacha, addr_cs: str) -> int:
         state = await gacha.functions.gachaStates(addr_cs).call()
         return int(state[0])
     except Exception as e:
+        _raise_if_proxy_auth_error(e)
         logger.warning(f"gachaStates ошибка: {e}")
         return 0
 
@@ -422,6 +437,7 @@ async def _get_usdsc_balance(usdsc, addr_cs: str) -> int:
     try:
         return await usdsc.functions.balanceOf(addr_cs).call()
     except Exception as e:
+        _raise_if_proxy_auth_error(e)
         logger.warning(f"[{addr_cs[:8]}] USDSC balanceOf ошибка: {e}")
         return 0
 
@@ -504,7 +520,8 @@ async def _get_sale_status(sale_contract, addr_cs: str) -> int:
     try:
         state = await sale_contract.functions.saleStates(addr_cs).call()
         return int(state[0])
-    except Exception:
+    except Exception as e:
+        _raise_if_proxy_auth_error(e)
         return 0
 
 
@@ -574,6 +591,7 @@ async def _resolve_pending_sale(
         _inc_press_a_stats(eoa_address, eth_gas_wei=result_gas)
         logger.success(f"[{addr_cs[:8]}] Pending sale разрешена")
     except Exception as e:
+        _raise_if_proxy_auth_error(e)
         logger.warning(f"[{addr_cs[:8]}] getSaleResult (pending resolve) ошибка: {e}")
     return True
 
@@ -600,41 +618,56 @@ def _get_on_chain_item_inventory(address: str, proxy: Optional[str] = None) -> l
         f"{BLOCKSCOUT_API}/addresses/{addr_cs}/token-transfers"
         f"?type=ERC-1155&token={GAME_NFT_CONTRACT}"
     )
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    balances: dict[int, int] = {}
+    proxy_chain = build_proxy_chain(proxy, _load_proxy_pool())
+    if not proxy_chain:
+        proxy_chain = [None]
 
-    try:
-        next_params: Optional[dict[str, Any]] = None
-        while True:
-            req_url = url
-            if next_params:
-                req_url = f"{url}&" + "&".join(f"{k}={v}" for k, v in next_params.items())
-            resp = requests.get(req_url, proxies=proxies, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items") or []
+    last_error: Optional[Exception] = None
+    for idx, proxy_candidate in enumerate(proxy_chain, start=1):
+        proxies = {"http": proxy_candidate, "https": proxy_candidate} if proxy_candidate else None
+        balances: dict[int, int] = {}
+        try:
+            next_params: Optional[dict[str, Any]] = None
+            while True:
+                req_url = url
+                if next_params:
+                    req_url = f"{url}&" + "&".join(f"{k}={v}" for k, v in next_params.items())
+                resp = requests.get(req_url, proxies=proxies, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("items") or []
 
-            for item in items:
-                total_obj = item.get("total") or {}
-                token_id = int(total_obj.get("token_id") or 0)
-                value = int(total_obj.get("value") or item.get("value", 0) or 0)
-                from_addr = (item.get("from") or {}).get("hash", "")
-                to_addr   = (item.get("to")   or {}).get("hash", "")
+                for item in items:
+                    total_obj = item.get("total") or {}
+                    token_id = int(total_obj.get("token_id") or 0)
+                    value = int(total_obj.get("value") or item.get("value", 0) or 0)
+                    from_addr = (item.get("from") or {}).get("hash", "")
+                    to_addr   = (item.get("to")   or {}).get("hash", "")
 
-                if token_id < INITIAL_TICKET_TOKEN_ID:
-                    if to_addr and to_addr.lower() == addr_cs.lower():
-                        balances[token_id] = balances.get(token_id, 0) + value
-                    if from_addr and from_addr.lower() == addr_cs.lower():
-                        balances[token_id] = balances.get(token_id, 0) - value
+                    if token_id < INITIAL_TICKET_TOKEN_ID:
+                        if to_addr and to_addr.lower() == addr_cs.lower():
+                            balances[token_id] = balances.get(token_id, 0) + value
+                        if from_addr and from_addr.lower() == addr_cs.lower():
+                            balances[token_id] = balances.get(token_id, 0) - value
 
-            next_params = data.get("next_page_params")
-            if not next_params:
-                break
+                next_params = data.get("next_page_params")
+                if not next_params:
+                    break
 
-        return [(tid, amt) for tid, amt in balances.items() if amt > 0]
-    except Exception as e:
-        logger.warning(f"[{address}] Blockscout item inventory failed: {e}")
-        return []
+            return [(tid, amt) for tid, amt in balances.items() if amt > 0]
+        except Exception as e:
+            last_error = e
+            if proxy_candidate and is_proxy_auth_error(e) and idx < len(proxy_chain):
+                logger.warning(f"[{address}] Blockscout proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий")
+                continue
+            _raise_if_proxy_auth_error(e)
+            logger.warning(f"[{address}] Blockscout item inventory failed: {e}")
+            return []
+
+    if last_error:
+        _raise_if_proxy_auth_error(last_error)
+        logger.warning(f"[{address}] Blockscout item inventory failed: {last_error}")
+    return []
 
 
 async def _ensure_game_nft_approvals(
@@ -664,6 +697,7 @@ async def _ensure_game_nft_approvals(
                 )
                 await _action_delay()
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{addr_cs[:8]}] setApprovalForAll({name}): {e}")
 
 
@@ -755,6 +789,7 @@ async def _mint_rug_usdsc(
                         logger.success(f"[{addr_cs[:8]}] UNIQUE выпал при Rug bootstrap!")
                         return True
             except Exception as e:
+                _raise_if_proxy_auth_error(e)
                 logger.warning(f"[{addr_cs[:8]}] Rug USDSC batch ошибка: {e} — пропуск батча")
                 await _action_delay()
                 continue
@@ -779,6 +814,7 @@ async def _mint_rug_usdsc(
                         logger.success(f"[{addr_cs[:8]}] UNIQUE выпал при Rug Free mint!")
                         return True
             except Exception as e:
+                _raise_if_proxy_auth_error(e)
                 logger.warning(f"[{addr_cs[:8]}] Rug Free mint ошибка: {e} — пропуск")
                 await _action_delay()
                 continue
@@ -848,6 +884,7 @@ async def _spin_all_shell(
                         logger.success(f"[{addr_cs[:8]}] UNIQUE выпал при Shell спине!")
                         return True
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{addr_cs[:8]}] Shell spin ошибка: {e} — пропуск")
 
         shell_bal -= count
@@ -904,6 +941,7 @@ async def _spin_all_stone(
                     logger.success(f"[{addr_cs[:8]}] UNIQUE выпал при Stone спине!")
                     return True
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{addr_cs[:8]}] Stone spin ошибка: {e} — пропуск")
 
         stone_bal -= count
@@ -981,6 +1019,7 @@ async def _spin_by_tickets(
                     return True
         return False
     except Exception as e:
+        _raise_if_proxy_auth_error(e)
         logger.warning(f"[{addr_cs[:8]}] {label} spin ошибка: {e} — пропуск")
         return False
 
@@ -1005,6 +1044,7 @@ async def _pre_spin_best_tickets(
         shell = int(await game_nft.functions.balanceOf(addr_cs, TOKEN_SHELL).call())
         stone = int(await game_nft.functions.balanceOf(addr_cs, TOKEN_STONE).call())
     except Exception as e:
+        _raise_if_proxy_auth_error(e)
         logger.warning(f"[{addr_cs[:8]}] balanceOf тикетов ошибка: {e}")
         return False
 
@@ -1181,6 +1221,7 @@ async def _sell_all_items(
                     result_gas = _get_gas_cost_from_receipt(dict(result_receipt)) if result_receipt else 0
                     _inc_press_a_stats(eoa_address, eth_gas_wei=result_gas)
                 except Exception as e:
+                    _raise_if_proxy_auth_error(e)
                     logger.warning(f"[{addr_cs[:8]}] getSaleResult fallback ошибка: {e} — прерываем продажи")
                     break
                 # getSaleResult прошёл → продажа разрешена, продолжаем цикл
@@ -1197,6 +1238,7 @@ async def _sell_all_items(
             result_gas = _get_gas_cost_from_receipt(dict(result_receipt)) if result_receipt else 0
             _inc_press_a_stats(eoa_address, eth_gas_wei=result_gas)
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{addr_cs[:8]}] Продажа ошибка: {e} — прерываем продажи")
             break
         await _action_delay()
@@ -1213,6 +1255,7 @@ async def _run_press_a_session(
     gas_multiplier: float = 1.2,
     lifi_api_key: Optional[str] = None,
     config: Optional[dict] = None,
+    proxy_pool: Optional[list[str]] = None,
 ) -> bool:
     """
     Полный запуск Press A: bootstrap + основной цикл.
@@ -1240,11 +1283,17 @@ async def _run_press_a_session(
         # ── Режим: только checkIn (без bootstrap/spin/sell) ───────────────────
         if checkin_only:
             try:
-                done_api = await asyncio.to_thread(check_press_a_done, eoa_address)
+                done_api = await asyncio.to_thread(
+                    check_press_a_done,
+                    eoa_address,
+                    to_proxy_dict(proxy),
+                    proxy_pool,
+                )
                 if done_api is True:
                     logger.info(f"[{eoa_address[:8]}] Press A Unique уже получен (portal) — checkIn не требуется")
                     return True
             except Exception as e:
+                _raise_if_proxy_auth_error(e)
                 logger.warning(f"[{eoa_address[:8]}] Portal check_press_a_done ошибка: {e} — продолжаем checkIn")
 
             try:
@@ -1263,6 +1312,7 @@ async def _run_press_a_session(
                     ci_state = await gacha.functions.checkInStates(addr_cs).call()
                     logger.info(f"[{eoa_address[:8]}] checkIn сегодня выполнен (count={ci_state[1]})")
             except Exception as e:
+                _raise_if_proxy_auth_error(e)
                 logger.warning(f"[{eoa_address[:8]}] checkIn ошибка: {e}")
 
             return True
@@ -1291,6 +1341,7 @@ async def _run_press_a_session(
             if await _resolve_pending_sale(w3, account, sale, addr_cs, eoa_address, gas_multiplier):
                 await _action_delay()
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{eoa_address[:8]}] Resolve pending sale ошибка: {e}")
 
         # ── 1. checkIn ────────────────────────────────────────────────────────
@@ -1311,6 +1362,7 @@ async def _run_press_a_session(
                 ci_state = await gacha.functions.checkInStates(addr_cs).call()
                 logger.info(f"[{eoa_address[:8]}] checkIn уже выполнен (count={ci_state[1]})")
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{eoa_address[:8]}] checkIn ошибка: {e}")
 
         # ── 2. Approvals (нужны для списания тикетов/Sale) ────────────────────
@@ -1327,6 +1379,7 @@ async def _run_press_a_session(
                 db.upsert_account(eoa_address, press_a_done=True)
                 return True
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{eoa_address[:8]}] Pre-spin тикетов ошибка: {e} — продолжаем основной цикл")
 
         # ── 3. USDSC check + swap ─────────────────────────────────────────────
@@ -1351,6 +1404,7 @@ async def _run_press_a_session(
                     usdsc_bal = await _get_usdsc_balance(usdsc, addr_cs)
                     logger.info(f"[{eoa_address[:8]}] После свапа USDSC: {usdsc_bal/1e6:.4f}")
                 except Exception as e:
+                    _raise_if_proxy_auth_error(e)
                     logger.warning(f"[{eoa_address[:8]}] LI.FI swap ошибка: {e}")
             else:
                 logger.warning(f"[{eoa_address[:8]}] Нет LI.FI API ключа, пропускаем покупку USDSC")
@@ -1373,6 +1427,7 @@ async def _run_press_a_session(
                         db.upsert_account(eoa_address, press_a_done=True)
                         return True
                 except Exception as e:
+                    _raise_if_proxy_auth_error(e)
                     logger.warning(f"[{eoa_address[:8]}] Bootstrap mint ошибка: {e} — продолжаем")
             else:
                 logger.warning(f"[{eoa_address[:8]}] USDSC = 0, пропускаем Rug bootstrap")
@@ -1381,6 +1436,7 @@ async def _run_press_a_session(
         try:
             await _sell_all_items(w3, account, addr_cs, eoa_address, sale, gas_multiplier, proxy)
         except Exception as e:
+            _raise_if_proxy_auth_error(e)
             logger.warning(f"[{eoa_address[:8]}] Первая продажа ошибка: {e} — продолжаем")
 
         # ── 6. Основной цикл (только тикеты) ─────────────────────────────────
@@ -1394,6 +1450,7 @@ async def _run_press_a_session(
                     db.upsert_account(eoa_address, press_a_done=True)
                     return True
             except Exception as e:
+                _raise_if_proxy_auth_error(e)
                 logger.warning(f"[{eoa_address[:8]}] Shell spin ошибка: {e}")
 
             try:
@@ -1403,14 +1460,21 @@ async def _run_press_a_session(
                     db.upsert_account(eoa_address, press_a_done=True)
                     return True
             except Exception as e:
+                _raise_if_proxy_auth_error(e)
                 logger.warning(f"[{eoa_address[:8]}] Stone spin ошибка: {e}")
 
             try:
                 await _sell_all_items(w3, account, addr_cs, eoa_address, sale, gas_multiplier, proxy)
             except Exception as e:
+                _raise_if_proxy_auth_error(e)
                 logger.warning(f"[{eoa_address[:8]}] Продажа ошибка: {e}")
 
-            done = await asyncio.to_thread(check_press_a_done, eoa_address)
+            done = await asyncio.to_thread(
+                check_press_a_done,
+                eoa_address,
+                to_proxy_dict(proxy),
+                proxy_pool,
+            )
             if done:
                 db.upsert_account(eoa_address, press_a_done=True)
                 return True
@@ -1440,12 +1504,11 @@ def run_press_a_for_account(
     False = ошибка или нужен следующий запуск.
     """
     db.init_db()
-
-    done_api = check_press_a_done(eoa_address)
-    if done_api is True:
-        db.upsert_account(eoa_address, press_a_done=True)
-        logger.info(f"[{eoa_address[:8]}] Press A Unique уже получен (portal)")
-        return True
+    proxy_url = f"http://{proxy}" if proxy and not proxy.startswith("http") else proxy
+    proxy_pool = _load_proxy_pool()
+    proxy_chain = build_proxy_chain(proxy_url, proxy_pool)
+    if not proxy_chain:
+        proxy_chain = [None]
 
     acc = db.get_account_info(eoa_address) or {}
     checkin_only = bool((config or {}).get("press_a_checkin_only", False))
@@ -1454,29 +1517,44 @@ def run_press_a_for_account(
         return True
 
     logger.info(f"[{eoa_address[:8]}] Запуск Press A сессии...")
-    proxy_url = f"http://{proxy}" if proxy and not proxy.startswith("http") else proxy
-
-    try:
-        got_unique = asyncio.run(
-            _run_press_a_session(
-                private_key,
+    for idx, proxy_candidate in enumerate(proxy_chain, start=1):
+        try:
+            done_api = check_press_a_done(
                 eoa_address,
-                rpc_url,
-                proxy=proxy_url,
-                disable_ssl=disable_ssl,
-                gas_multiplier=gas_multiplier,
-                lifi_api_key=lifi_api_key,
-                config=config,
+                proxies=to_proxy_dict(proxy_candidate),
+                proxy_pool=proxy_pool,
             )
-        )
-        if got_unique and (not checkin_only):
-            db.upsert_account(eoa_address, press_a_done=True)
-            logger.success(f"[{eoa_address[:8]}] Press A выполнен!")
-        elif checkin_only:
-            logger.info(f"[{eoa_address[:8]}] checkIn-only: выполнено")
-        else:
-            logger.info(f"[{eoa_address[:8]}] Unique не выпал, запустить снова")
-        return got_unique
-    except Exception as e:
-        logger.error(f"[{eoa_address[:8]}] Press A ошибка: {e}")
-        return False
+            if done_api is True:
+                db.upsert_account(eoa_address, press_a_done=True)
+                logger.info(f"[{eoa_address[:8]}] Press A Unique уже получен (portal)")
+                return True
+
+            got_unique = asyncio.run(
+                _run_press_a_session(
+                    private_key,
+                    eoa_address,
+                    rpc_url,
+                    proxy=proxy_candidate,
+                    disable_ssl=disable_ssl,
+                    gas_multiplier=gas_multiplier,
+                    lifi_api_key=lifi_api_key,
+                    config=config,
+                    proxy_pool=proxy_pool,
+                )
+            )
+            if got_unique and (not checkin_only):
+                db.upsert_account(eoa_address, press_a_done=True)
+                logger.success(f"[{eoa_address[:8]}] Press A выполнен!")
+            elif checkin_only:
+                logger.info(f"[{eoa_address[:8]}] checkIn-only: выполнено")
+            else:
+                logger.info(f"[{eoa_address[:8]}] Unique не выпал, запустить снова")
+            return got_unique
+        except Exception as e:
+            if proxy_candidate and is_proxy_auth_error(e) and idx < len(proxy_chain):
+                logger.warning(f"[{eoa_address[:8]}] Press A proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий")
+                continue
+            logger.error(f"[{eoa_address[:8]}] Press A ошибка: {e}")
+            return False
+
+    return False

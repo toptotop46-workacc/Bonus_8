@@ -12,13 +12,18 @@ import asyncio
 import json
 import random
 import time
+from pathlib import Path
 from typing import Optional
 
 from web3 import AsyncWeb3
 
 from modules import logger, db
+from modules.proxy_utils import build_proxy_chain, is_proxy_auth_error, load_proxies_from_file
 from modules.web3_utils import get_w3, get_account, send_contract_tx, close_web3_provider
 from modules.portal_api import check_nekocat_gmeow_done, get_nekocat_progress
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROXY_FILE = PROJECT_ROOT / "proxy.txt"
 
 # ── GMeow (NekoActivityReward) ─────────────────────────────────────────────
 
@@ -56,6 +61,34 @@ FOOD_PRICE_WEI = 25_000_000_000_000
 # Целевые счётчики за сезон
 GMEOW_TARGET = 10
 FOOD_TARGET = 5
+
+
+def _run_with_proxy_rotation(
+    eoa_address: str,
+    action_label: str,
+    initial_proxy: Optional[str],
+    runner,
+):
+    proxy_chain = build_proxy_chain(initial_proxy, load_proxies_from_file(PROXY_FILE))
+    if not proxy_chain:
+        return runner(None)
+
+    last_error: Optional[Exception] = None
+    for idx, proxy_url in enumerate(proxy_chain, start=1):
+        try:
+            return runner(proxy_url)
+        except Exception as exc:
+            last_error = exc
+            if proxy_url and is_proxy_auth_error(exc) and idx < len(proxy_chain):
+                logger.warning(
+                    f"[{eoa_address}] {action_label}: proxy 407 ({idx}/{len(proxy_chain)}), пробуем следующий"
+                )
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+    return runner(None)
 
 
 async def _do_gmeow_checkin(
@@ -184,10 +217,19 @@ def run_nekocat_for_account(
         else:
             logger.info(f"[{eoa_address}] NekoCat GMeow ({gmeow_count}/{GMEOW_TARGET})...")
             try:
-                tx = asyncio.run(_do_gmeow_checkin(
-                    private_key, eoa_address, rpc_url,
-                    proxy=proxy_url, disable_ssl=disable_ssl, gas_multiplier=gas_multiplier,
-                ))
+                tx = _run_with_proxy_rotation(
+                    eoa_address,
+                    "GMeow",
+                    proxy_url,
+                    lambda proxy_candidate: asyncio.run(_do_gmeow_checkin(
+                        private_key,
+                        eoa_address,
+                        rpc_url,
+                        proxy=proxy_candidate,
+                        disable_ssl=disable_ssl,
+                        gas_multiplier=gas_multiplier,
+                    )),
+                )
                 if tx is None:
                     logger.info(f"[{eoa_address}] GMeow: уже сделан сегодня (canSignToday=false), пропуск")
                 else:
@@ -212,17 +254,22 @@ def run_nekocat_for_account(
             f"минтим еду через NekoCatFood без кота"
         )
         try:
-            tx = asyncio.run(
-                _buy_food_once(
-                    private_key,
-                    eoa_address,
-                    rpc_url,
-                    proxy=proxy_url,
-                    disable_ssl=disable_ssl,
-                    gas_multiplier=gas_multiplier,
-                    food_type_id=0,
-                    amount=1,
-                )
+            tx = _run_with_proxy_rotation(
+                eoa_address,
+                "NekoCat Food",
+                proxy_url,
+                lambda proxy_candidate: asyncio.run(
+                    _buy_food_once(
+                        private_key,
+                        eoa_address,
+                        rpc_url,
+                        proxy=proxy_candidate,
+                        disable_ssl=disable_ssl,
+                        gas_multiplier=gas_multiplier,
+                        food_type_id=0,
+                        amount=1,
+                    )
+                ),
             )
             if tx:
                 food_count += 1
