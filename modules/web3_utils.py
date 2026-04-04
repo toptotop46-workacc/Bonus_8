@@ -295,41 +295,59 @@ async def send_contract_tx(
     value: int = 0,
     action: str = "",
     gas_multiplier: float = 1.2,
+    max_retries: int = 3,
+    retry_delay: float = 15.0,
 ) -> str:
     """
     Строит + отправляет вызов контрактной функции (contract.functions.foo().build_transaction).
     Автоматически симулирует и оценивает газ.
+    При реверте транзакции повторяет попытку до max_retries раз с паузой retry_delay секунд.
     """
-    from_addr = AsyncWeb3.to_checksum_address(account.address)
-    nonce = await get_nonce(w3, from_addr)
-    chain_id = await w3.eth.chain_id
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        from_addr = AsyncWeb3.to_checksum_address(account.address)
+        nonce = await get_nonce(w3, from_addr)
+        chain_id = await w3.eth.chain_id
 
-    latest_block = await w3.eth.get_block("latest")
-    base_fee = int(latest_block["baseFeePerGas"])
-    max_priority_fee = await w3.eth.max_priority_fee
-    rand_mult = random.uniform(1.0, 1.2)
-    max_priority_fee = int(max_priority_fee * rand_mult)
-    max_fee_per_gas = max_priority_fee + base_fee * 2
+        latest_block = await w3.eth.get_block("latest")
+        base_fee = int(latest_block["baseFeePerGas"])
+        max_priority_fee = await w3.eth.max_priority_fee
+        rand_mult = random.uniform(1.0, 1.2)
+        max_priority_fee = int(max_priority_fee * rand_mult)
+        max_fee_per_gas = max_priority_fee + base_fee * 2
 
-    tx: TxParams = await contract_func.build_transaction({
-        "from": from_addr,
-        "nonce": nonce,
-        "chainId": chain_id,
-        "maxPriorityFeePerGas": max_priority_fee,
-        "maxFeePerGas": max_fee_per_gas,
-        "value": value,
-        "gas": 0,
-        "type": 2,
-    })
+        tx: TxParams = await contract_func.build_transaction({
+            "from": from_addr,
+            "nonce": nonce,
+            "chainId": chain_id,
+            "maxPriorityFeePerGas": max_priority_fee,
+            "maxFeePerGas": max_fee_per_gas,
+            "value": value,
+            "gas": 0,
+            "type": 2,
+        })
 
-    # Симуляция
-    await simulate_tx(w3, tx)
+        # Симуляция
+        await simulate_tx(w3, tx)
 
-    # Оценка газа
-    try:
-        estimated = await w3.eth.estimate_gas(tx)
-        tx["gas"] = int(estimated * gas_multiplier)
-    except Exception as e:
-        raise RuntimeError(f"estimate_gas упал: {e}") from e
+        # Оценка газа
+        try:
+            estimated = await w3.eth.estimate_gas(tx)
+            tx["gas"] = int(estimated * gas_multiplier)
+        except Exception as e:
+            raise RuntimeError(f"estimate_gas упал: {e}") from e
 
-    return await send_tx(w3, account, tx, action=action)
+        try:
+            return await send_tx(w3, account, tx, action=action)
+        except RuntimeError as e:
+            if "зареверчена" in str(e).lower() and attempt < max_retries:
+                last_exc = e
+                logger.warning(
+                    f"{action} | Попытка {attempt}/{max_retries} провалилась (реверт), "
+                    f"повтор через {retry_delay:.0f}с..."
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+            raise
+
+    raise last_exc  # type: ignore[misc]

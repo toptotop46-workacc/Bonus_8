@@ -54,31 +54,28 @@ def load_config() -> dict:
 # ── Wallets & Proxies ────────────────────────────────────────────────────────
 
 def load_wallets() -> list[tuple[str, str]]:
-    """Возвращает список (private_key, eoa_address)."""
-    path = PROJECT_ROOT / "keys.txt"
-    if not path.exists():
-        logger.error(f"keys.txt не найден: {path}")
-        sys.exit(1)
+    """Возвращает список (private_key, eoa_address). Поддерживает keys.enc и keys.txt."""
+    from modules.crypto_utils import load_keys_plaintext
+    plaintext = load_keys_plaintext(PROJECT_ROOT)
     result = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if re.match(r"^0x[a-fA-F0-9]{64}$", line):
-                pk = line
-            elif re.match(r"^[a-fA-F0-9]{64}$", line):
-                pk = "0x" + line
-            else:
-                logger.warning(f"Неверный формат ключа, пропуск: {line[:10]}...")
-                continue
-            try:
-                addr = Web3.to_checksum_address(Web3().eth.account.from_key(pk).address)
-                result.append((pk, addr))
-            except Exception as e:
-                logger.warning(f"Ошибка получения адреса из ключа: {e}")
+    for line in plaintext.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.match(r"^0x[a-fA-F0-9]{64}$", line):
+            pk = line
+        elif re.match(r"^[a-fA-F0-9]{64}$", line):
+            pk = "0x" + line
+        else:
+            logger.warning(f"Неверный формат ключа, пропуск: {line[:10]}...")
+            continue
+        try:
+            addr = Web3.to_checksum_address(Web3().eth.account.from_key(pk).address)
+            result.append((pk, addr))
+        except Exception as e:
+            logger.warning(f"Ошибка получения адреса из ключа: {e}")
     if not result:
-        logger.error("Нет валидных приватных ключей в keys.txt")
+        logger.error("Нет валидных приватных ключей")
         sys.exit(1)
     return result
 
